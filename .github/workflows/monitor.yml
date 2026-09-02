@@ -1,0 +1,113 @@
+# ML drift monitor - scheduled workflow
+#
+# Runs every Monday (and on manual dispatch):
+#   job 1 (drift-check): advances the monitored stream by one batch, runs the
+#     drift check against the next batch (Evidently + realised performance)
+#     and reports NEEDS_RETRAIN in its job output.
+#   job 2 (retrain):      only when job 1's output says the threshold was
+#     crossed -> retrains the model on the updated data window, logs it to
+#     MLflow and registers the new version as `production`.
+#
+# Script contract (see src/monitor.py):
+#   python -m src.monitor --check-next
+#     prints  NEEDS_RETRAIN=true|false   and   PROCESSED_BATCH=... DECISION=...
+#   python -m src.monitor --retrain-flagged
+#     trains the updated window, registers the new production version.
+#
+# NOTE on persistence: GitHub-hosted runners are ephemeral.  This repo's
+# monitoring state (data/stream/*), the MLflow sqlite DB and the batch CSVs
+# live on disk, so on GitHub you must persist them between runs (check them in,
+# attach them as an artifact, or run on a self-hosted runner with a persistent
+# workspace).  The identical logic runs locally with:
+#   bash scripts/run_scheduled_local.sh
+name: ML drift monitor
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'          # every Monday 03:00 UTC
+  workflow_dispatch: {}          # manual trigger for demos
+
+env:
+  MLFLOW_TRACKING_URI: sqlite:///mlflow/mlflow.db
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    name: Drift check (next batch)
+    runs-on: ubuntu-latest
+    outputs:
+      needs_retrain: ${{ steps.check.outputs.needs_retrain }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build stream once (idempotent)
+        run: python -m src.simulate_stream || true
+
+      - name: Bootstrap initial model if no production model exists yet
+        run: |
+          python - <<'PY'
+          from src import registry
+          registry.setup_tracking()
+          if registry.production_version() is None:
+              import subprocess, sys
+              subprocess.run(
+                  [sys.executable, "-m", "src.train", "--data-csv",
+                   "data/stream/reference.csv",
+                   "--description", "initial model on reference window",
+                   "--tag", "trained_on=reference", "--tag", "trigger=initial"],
+                  check=True)
+              print("bootstrapped initial model v1")
+          else:
+              print("production model already exists - skipping bootstrap")
+          PY
+
+      - name: Drift-check the next batch
+        id: check
+        run: |
+          set -euo pipefail
+          OUT=$(python -m src.monitor --check-next)
+          echo "$OUT"
+          NEEDS=$(echo "$OUT" | sed -n 's/^NEEDS_RETRAIN=\(.*\)$/\1/p')
+          echo "needs_retrain=${NEEDS:-false}" >> "$GITHUB_OUTPUT"
+        # NOTE: --check-next only *flags*; the retrain is the job below, so the
+        # conditional step in this workflow is driven by the job output (and
+        # by extension by the script's NEEDS_RETRAIN line / exit semantics).
+
+  retrain:
+    name: Retrain on updated window
+    needs: drift-check
+    if: needs.drift-check.outputs.needs_retrain == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Retrain + register new production version
+        run: |
+          python -m src.monitor --retrain-flagged | tee retrain.log
+          grep '^RETRAIN_OK' retrain.log || exit 1
+
+      - name: Refresh summary figures
+        run: python -m src.figures
+
+      - name: Upload monitoring reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-reports
+          path: |
+            reports/timeline.csv
+            reports/model_versions.csv
+            reports/figures/*.png

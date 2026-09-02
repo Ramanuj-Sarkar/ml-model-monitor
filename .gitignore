@@ -13,3 +13,18 @@ results_pipeline.log
 # IDE
 .idea/
 .DS_Store
+
+# MLflow (tracking store + artifacts)
+mlflow/
+mlruns/
+
+# Generated data stream + monitoring state (regenerable via the scripts)
+data/stream/
+
+# Generated reports (regenerable; Evidently HTML reports are large)
+reports/html/
+reports/batch_details/
+reports/timeline.csv
+reports/timeline.json
+reports/model_versions.csv
+reports/figures/
