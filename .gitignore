@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+.mplconfig/
+.uv-cache/
+.uv-pythons/
+
+# Build / runtime artifacts
+catboost_info/
+results_pipeline.log
+
+# IDE
+.idea/
+.DS_Store
